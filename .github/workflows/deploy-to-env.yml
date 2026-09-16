@@ -1,0 +1,665 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# GitHub Actions port of `Pipelines/devops/templates/deploy-to-env.yaml` (Azure DevOps)
+# ══════════════════════════════════════════════════════════════════════════════
+# ⚠️ REPO-TEMPLATE LOCATION NOTICE
+# In THIS repo-template this file lives at `Pipelines/.github/workflows/`. GitHub
+# Actions only discovers/calls workflows under `.github/workflows/` AT THE ROOT
+# of a repository — when copying this pipeline into a real project repo, move
+# this file (and its neighbours, `power-platform-release.yml` + `README.md`) to
+# `.github/workflows/` at that repo's root. Only then does the
+# `uses: ./.github/workflows/deploy-to-env.yml` reference in the caller
+# workflow resolve (that reference is repo-root-relative, not relative to the
+# caller file, so its syntax never needs to change).
+#
+# Reusable workflow that deploys a Power Platform solution to one environment.
+# - Downloads the `release-bundle` artifact produced by the build job
+# - Locates the versioned solution zip
+# - Inspects the DSF template for configuration requirements
+# - Merges the per-environment override secret into the DSF
+# - Detects fresh install vs upgrade and imports the solution
+#
+# The Azure DevOps template `Pipelines/devops/templates/deploy-to-env.yaml` is
+# still the source of truth for ADO and is NOT modified by this file.
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: Deploy to environment
+
+on:
+  workflow_call:
+    inputs:
+      environmentName:
+        description: 'Environment name (e.g., UAT, PROD, DEV). Must match a GitHub Environment.'
+        type: string
+        required: true
+      environmentDisplayName:
+        description: 'Environment display name for logs and summary'
+        type: string
+        required: true
+      solutionName:
+        description: 'Unique solution name (not display name)'
+        type: string
+        required: true
+      solutionVersion:
+        description: 'Solution version being deployed (display only)'
+        type: string
+        required: false
+        default: ''
+      artifactName:
+        description: 'Artifact name containing solution files'
+        type: string
+        required: false
+        default: 'release-bundle'
+      deployManaged:
+        description: 'Deploy managed package?'
+        type: boolean
+        required: false
+        default: true
+      forceOverwrite:
+        description: 'Force overwrite unmanaged components'
+        type: boolean
+        required: false
+        default: false
+      timeoutMinutes:
+        description: 'Deployment timeout in minutes'
+        type: number
+        required: false
+        default: 300
+      maxAsyncWaitTime:
+        description: 'Max async wait time for solution import (minutes)'
+        type: number
+        required: false
+        default: 120
+
+    secrets:
+      PP_URL:
+        description: 'Dataverse environment URL for the target environment'
+        required: true
+      PP_APP_ID:
+        description: 'Service principal application (client) id'
+        required: true
+      PP_CLIENT_SECRET:
+        description: 'Service principal client secret'
+        required: true
+      PP_TENANT_ID:
+        description: 'Entra ID tenant id'
+        required: true
+      PP_DSF_OVERRIDES:
+        description: >-
+          Environment-specific Deployment Settings File overrides, as raw JSON.
+          Replaces the ADO `DownloadSecureFile@1` step (GitHub has no Secure
+          Files). Optional: when empty/unset the DSF template is used as-is,
+          exactly like the ADO template behaves when the Secure File is missing.
+
+          READ TIMING - this matters. A value passed in here by the caller comes
+          from an organization/repository secret, and those "are read when a
+          workflow run is queued"; editing it while the run is in flight has NO
+          effect on the jobs that have not started yet. Define the override as an
+          ENVIRONMENT secret named `PP_DSF_OVERRIDES` on the GitHub Environment
+          instead: environment secrets "are read when a job referencing the
+          environment starts" (i.e. after the approval gate), and they take
+          precedence over whatever the caller passed. See the neighbouring
+          `README.md` section 5.1 (this file's `Pipelines/.github/workflows/
+          README.md` here; `.github/workflows/README.md` once relocated to a
+          real project repo).
+          https://docs.github.com/en/actions/reference/security/secrets#when-github-actions-reads-secrets
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: '${{ inputs.environmentDisplayName }} deployment'
+    runs-on: windows-latest
+    # Equivalent of ADO's `- deployment: ... environment: '<name>'`.
+    # Manual approvals are configured in GitHub under
+    # Settings > Environments > <name> > Required reviewers.
+    environment: ${{ inputs.environmentName }}
+    timeout-minutes: ${{ inputs.timeoutMinutes }}
+
+    env:
+      # Inputs are exposed as env vars rather than interpolated into `run:`
+      # bodies (quoting safety + no script injection).
+      SOLUTION_NAME: ${{ inputs.solutionName }}
+      SOLUTION_VERSION: ${{ inputs.solutionVersion }}
+      ENV_DISPLAY_NAME: ${{ inputs.environmentDisplayName }}
+      DEPLOY_MANAGED: ${{ inputs.deployManaged }}
+      FORCE_OVERWRITE: ${{ inputs.forceOverwrite }}
+      # NOTE: the `runner` context is NOT available in job-level `env:` (only in
+      # `steps.env` / `steps.with` / `steps.run`), so the artifact directory
+      # cannot be precomputed here as `${{ runner.temp }}\...`. The steps below
+      # build it from the standard RUNNER_TEMP environment variable instead.
+      ARTIFACT_NAME: ${{ inputs.artifactName }}
+
+    steps:
+      # ────────────────────────────────────────────────────────────────────────
+      # Step 1: Download artifacts
+      # ────────────────────────────────────────────────────────────────────────
+      # There is no `- checkout: none` to port: a GHA job simply does not check
+      # out the repository unless actions/checkout is invoked.
+      - name: Download release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifactName }}
+          path: ${{ runner.temp }}\${{ inputs.artifactName }}
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Step 1.5: Find versioned solution zip file
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Find and validate solution zip file
+        id: find_solution
+        shell: pwsh
+        run: |
+          Write-Host "═══════════════════════════════════════════════════════════"
+          Write-Host "STEP: Finding Solution Zip File"
+          Write-Host "═══════════════════════════════════════════════════════════"
+
+          $artifactPath  = Join-Path $env:RUNNER_TEMP $env:ARTIFACT_NAME
+          $deployManaged = $env:DEPLOY_MANAGED
+          $solutionName  = $env:SOLUTION_NAME
+
+          # NOTE: GHA renders boolean inputs as lowercase 'true'/'false',
+          # whereas ADO rendered them as 'True'/'False'.
+          $pattern = if ($deployManaged -eq 'true') {
+            "$($solutionName)_*_managed.zip"
+          } else {
+            "$($solutionName)_*_unmanaged.zip"
+          }
+
+          Write-Host "Looking for solution files matching: $pattern"
+          Write-Host "In directory: $artifactPath"
+
+          # Verify artifact directory exists
+          if (-not (Test-Path $artifactPath)) {
+              Write-Host "::error::Artifact directory not found: $artifactPath"
+              throw "Artifact directory not found: $artifactPath"
+          }
+
+          $solutionFiles = @(Get-ChildItem -Path $artifactPath -Filter $pattern -File -ErrorAction SilentlyContinue)
+
+          if ($solutionFiles.Count -eq 0) {
+              Write-Host "::error::No solution file found matching pattern: $pattern"
+              Write-Host ""
+              Write-Host "Available files in artifact:"
+              Get-ChildItem -Path $artifactPath -File | ForEach-Object { Write-Host "  - $($_.Name)" }
+              throw "No solution file found matching pattern: $pattern"
+          }
+
+          if ($solutionFiles.Count -gt 1) {
+              Write-Host "⚠️  Multiple files found:"
+              $solutionFiles | ForEach-Object { Write-Host "  - $($_.Name)" }
+              Write-Host "Using the first file (sorted by name)"
+              Write-Host "::warning::Multiple solution files found, using first one"
+          }
+
+          $solutionFile     = ($solutionFiles | Sort-Object Name | Select-Object -First 1).Name
+          $solutionFilePath = Join-Path $artifactPath $solutionFile
+          $fileSize         = (Get-Item $solutionFilePath).Length / 1MB
+
+          Write-Host "✓ Selected solution file: $solutionFile"
+          Write-Host "  File size: $($fileSize.ToString('F2')) MB"
+
+          "solution-file-name=$solutionFile"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "solution-file-path=$solutionFilePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "═══════════════════════════════════════════════════════════"
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Step 2: Inspect DSF template
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Inspect DSF Template
+        id: inspect_dsf
+        shell: pwsh
+        run: |
+          Write-Host "═══════════════════════════════════════════════════════════"
+          Write-Host "STEP: Inspecting DSF Template"
+          Write-Host "═══════════════════════════════════════════════════════════"
+
+          $artifactPath = Join-Path $env:RUNNER_TEMP $env:ARTIFACT_NAME
+          $templatePath = Join-Path $artifactPath "$($env:SOLUTION_NAME).settings.json"
+
+          Write-Host "Looking for DSF template at: $templatePath"
+
+          # Check if DSF template exists
+          if (!(Test-Path $templatePath)) {
+            Write-Host "⚠️  No DSF template found. Will deploy without deployment settings."
+            Write-Host "::warning::No DSF template found for solution $($env:SOLUTION_NAME)"
+            "has-config=False"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "template-dsf="     | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          }
+
+          # Parse and analyze DSF template content
+          Write-Host "✓ DSF template found. Analyzing configuration..."
+
+          try {
+            $dsfContent = Get-Content $templatePath -Raw | ConvertFrom-Json
+          } catch {
+            Write-Host "::error::Failed to parse DSF template: $($_.Exception.Message)"
+            throw "Invalid JSON in DSF template: $templatePath"
+          }
+
+          $envVarsCount       = @($dsfContent.EnvironmentVariables).Count
+          $connRefsCount      = @($dsfContent.ConnectionReferences).Count
+          $copilotAgentsCount = @($dsfContent.CopilotAgents).Count
+          $hasConfiguration   = ($envVarsCount -gt 0 -or $connRefsCount -gt 0 -or $copilotAgentsCount -gt 0)
+
+          Write-Host "  - Environment Variables: $envVarsCount"
+          Write-Host "  - Connection References: $connRefsCount"
+          Write-Host "  - Copilot Agents: $copilotAgentsCount"
+          Write-Host "  - Requires Configuration: $hasConfiguration"
+
+          "template-dsf=$templatePath"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "has-config=$hasConfiguration" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+          Write-Host "═══════════════════════════════════════════════════════════"
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Step 3: Materialise the override secret on disk
+      # ────────────────────────────────────────────────────────────────────────
+      # Replaces `DownloadSecureFile@1`. GitHub has no Secure Files, so the
+      # per-environment override JSON lives in the `PP_DSF_OVERRIDES` secret and
+      # is written to a temp file here.
+      #
+      # `secrets.PP_DSF_OVERRIDES` below resolves, in order of precedence, to:
+      #   1. the ENVIRONMENT secret `PP_DSF_OVERRIDES` of the environment this
+      #      job targets, if one exists - read when this job STARTS, i.e. after
+      #      the approval gate, so an edit made while the job was waiting IS
+      #      picked up (this is the recommended wiring);
+      #   2. otherwise the value the caller passed in `jobs.<id>.secrets`, which
+      #      comes from a repository/organization secret and was therefore
+      #      frozen when the whole run was QUEUED (legacy fallback - an edit
+      #      made after the run started is NOT picked up).
+      # Ref: https://docs.github.com/en/actions/reference/security/secrets#when-github-actions-reads-secrets
+      #
+      # The "is the secret set?" test is done INSIDE PowerShell rather than in a
+      # step-level `if:` because the `secrets` context is NOT available in
+      # `jobs.<job_id>.steps.if` - only in `steps.env` / `steps.with`.
+      - name: Write DSF overrides from secret
+        id: write_overrides
+        shell: pwsh
+        env:
+          PP_DSF_OVERRIDES: ${{ secrets.PP_DSF_OVERRIDES }}
+        run: |
+          $overridesDir = Join-Path $env:RUNNER_TEMP 'dsf-overrides'
+          New-Item -ItemType Directory -Force -Path $overridesDir | Out-Null
+          $overrideFile = Join-Path $overridesDir "$($env:SOLUTION_NAME).overrides.json"
+
+          if ([string]::IsNullOrWhiteSpace($env:PP_DSF_OVERRIDES)) {
+              Write-Host "ℹ️  Secret PP_DSF_OVERRIDES is empty or not set for $($env:ENV_DISPLAY_NAME)."
+              Write-Host "   The DSF template will be used as-is (same behaviour as a missing ADO Secure File)."
+              "override-file=" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              exit 0
+          }
+
+          # Fail fast on malformed JSON instead of silently deploying the
+          # untouched template.
+          try {
+              $null = $env:PP_DSF_OVERRIDES | ConvertFrom-Json
+          } catch {
+              Write-Host "::error::Secret PP_DSF_OVERRIDES for $($env:ENV_DISPLAY_NAME) is not valid JSON: $($_.Exception.Message)"
+              exit 1
+          }
+
+          # ── Freshness fingerprint ────────────────────────────────────────────
+          # Secrets are opaque: nothing in the run tells you WHICH revision of the
+          # override JSON the job actually received, nor whether it came from the
+          # environment secret (read at job start) or from the caller's
+          # repository secret (frozen at queue time). A short digest closes that
+          # gap without ever printing the value: hash the same file locally and
+          # compare (the exact command is in the neighbouring README.md §5.1).
+          # This is a deliberate, bounded disclosure - 12 hex chars of a SHA-256
+          # over a multi-hundred-byte JSON document is not a practical oracle.
+          $bytes       = [System.Text.Encoding]::UTF8.GetBytes($env:PP_DSF_OVERRIDES)
+          $sha256      = [System.Security.Cryptography.SHA256]::Create()
+          $digest      = $sha256.ComputeHash($bytes)
+          $sha256.Dispose()
+          $fingerprint = ([System.BitConverter]::ToString($digest) -replace '-', '').Substring(0, 12).ToLowerInvariant()
+
+          Set-Content -LiteralPath $overrideFile -Value $env:PP_DSF_OVERRIDES -Encoding UTF8 -NoNewline
+          Write-Host "✓ Overrides written to: $overrideFile"
+          Write-Host "   fingerprint : $fingerprint  (first 12 hex chars of SHA-256 over the UTF-8 bytes)"
+          Write-Host "   size        : $($bytes.Length) bytes"
+          Write-Host "   If this fingerprint is not the one you expect, the job read a stale value:"
+          Write-Host "   see '5.1 When secrets and variables are read' in the neighbouring README.md."
+          "override-file=$overrideFile"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "override-fingerprint=$fingerprint" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Step 4: Prepare DSF (merge overrides if present)
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Prepare DSF (Merge Overrides)
+        id: prepare_dsf
+        shell: pwsh
+        env:
+          HAS_CONFIG:    ${{ steps.inspect_dsf.outputs.has-config }}
+          TEMPLATE_DSF:  ${{ steps.inspect_dsf.outputs.template-dsf }}
+          OVERRIDE_FILE: ${{ steps.write_overrides.outputs.override-file }}
+        run: |
+          Write-Host "═══════════════════════════════════════════════════════════"
+          Write-Host "STEP: Preparing Deployment Settings File (DSF)"
+          Write-Host "═══════════════════════════════════════════════════════════"
+
+          $hasConfig = $env:HAS_CONFIG
+
+          # Skip if no configuration required
+          if ($hasConfig -ne 'True') {
+            Write-Host "ℹ️  No configuration required. Skipping DSF preparation."
+            "use-dsf=false"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "working-dsf="   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          }
+
+          # Create working directory and copy template
+          $templatePath = $env:TEMPLATE_DSF
+          $workingDir   = Join-Path $env:RUNNER_TEMP 'dsf-working'
+          $workingDsf   = Join-Path $workingDir "$($env:SOLUTION_NAME).settings.json"
+
+          Write-Host "Creating working directory: $workingDir"
+          New-Item -ItemType Directory -Force -Path $workingDir | Out-Null
+
+          Write-Host "Copying template to working DSF: $workingDsf"
+          Copy-Item $templatePath $workingDsf -Force
+          $baseDsf = Get-Content $workingDsf -Raw | ConvertFrom-Json
+
+          # ─────────────────────────────────────────────────────────────
+          # Check if overrides are available
+          # ─────────────────────────────────────────────────────────────
+          $overrideFilePath = $env:OVERRIDE_FILE
+
+          $hasOverrides = -not [string]::IsNullOrWhiteSpace($overrideFilePath) `
+                        -and (Test-Path -LiteralPath $overrideFilePath -ErrorAction SilentlyContinue)
+
+          Write-Host "Override file: $overrideFilePath"
+          Write-Host "Override Available: $hasOverrides"
+
+          # ─────────────────────────────────────────────────────────────
+          # Merge overrides if available
+          # ─────────────────────────────────────────────────────────────
+          if ($hasOverrides) {
+            Write-Host ""
+            Write-Host "🔀 Merging overrides into DSF..."
+            $overrides = Get-Content $overrideFilePath -Raw | ConvertFrom-Json
+
+            # Register every injected value as a log mask. The override JSON is
+            # a GitHub secret, but GitHub only masks the secret as a WHOLE, not
+            # its individual field values - without this, the "Final DSF
+            # Content" dump below would leak them in clear text.
+            $maskValues = New-Object System.Collections.Generic.List[string]
+            foreach ($o in @($overrides.EnvironmentVariables)) { if ($o.Value)        { $maskValues.Add([string]$o.Value) } }
+            foreach ($o in @($overrides.ConnectionReferences)) { if ($o.ConnectionId) { $maskValues.Add([string]$o.ConnectionId) } }
+            foreach ($v in $maskValues) {
+              if ($v.Length -gt 4) { Write-Host "::add-mask::$v" }
+            }
+
+            # Merge Environment Variables (matched on SchemaName)
+            Write-Host "  → Merging Environment Variables..."
+            foreach ($override in @($overrides.EnvironmentVariables)) {
+              $target = $baseDsf.EnvironmentVariables | Where-Object { $_.SchemaName -eq $override.SchemaName }
+              if ($target) {
+                Write-Host "    • Updating: $($override.SchemaName)"
+                $target.Value = $override.Value
+              }
+            }
+
+            # Merge Connection References (matched on LogicalName)
+            Write-Host "  → Merging Connection References..."
+            foreach ($override in @($overrides.ConnectionReferences)) {
+              $target = $baseDsf.ConnectionReferences | Where-Object { $_.LogicalName -eq $override.LogicalName }
+              if ($target) {
+                Write-Host "    • Updating: $($override.LogicalName)"
+                if ($override.PSObject.Properties.Name -contains 'ConnectorId' -and $override.ConnectorId) {
+                  $target.ConnectorId = $override.ConnectorId
+                }
+                if ($override.PSObject.Properties.Name -contains 'ConnectionId' -and $override.ConnectionId) {
+                  $target.ConnectionId = $override.ConnectionId
+                }
+              }
+            }
+
+            # Merge Copilot Agents (matched on Id, then Name; added if missing)
+            if ($overrides.PSObject.Properties.Name -contains 'CopilotAgents') {
+              Write-Host "  → Merging Copilot Agents..."
+
+              # Initialize CopilotAgents property if not exists
+              if ($baseDsf.PSObject.Properties.Name -notcontains 'CopilotAgents') {
+                $baseDsf | Add-Member -Name CopilotAgents -MemberType NoteProperty -Value @()
+              }
+              if ($null -eq $baseDsf.CopilotAgents) {
+                $baseDsf.CopilotAgents = @()
+              }
+
+              foreach ($override in @($overrides.CopilotAgents)) {
+                $agentName = if ($override.Name) { $override.Name } else { $override.Id }
+
+                # Try to find matching agent by Id or Name
+                $target = $null
+                if ($override.PSObject.Properties.Name -contains 'Id' -and $override.Id) {
+                  $target = $baseDsf.CopilotAgents | Where-Object { $_.Id -eq $override.Id }
+                }
+                if (-not $target -and $override.PSObject.Properties.Name -contains 'Name' -and $override.Name) {
+                  $target = $baseDsf.CopilotAgents | Where-Object { $_.Name -eq $override.Name }
+                }
+
+                if ($target) {
+                  Write-Host "    • Updating: $agentName"
+                  # Merge all properties from override into target
+                  foreach ($prop in $override.PSObject.Properties) {
+                    if ($null -ne $prop.Value) {
+                      $target.$($prop.Name) = $prop.Value
+                    }
+                  }
+                } else {
+                  Write-Host "    • Adding new: $agentName"
+                  $baseDsf.CopilotAgents += $override
+                }
+              }
+            }
+
+            # Save merged DSF
+            Write-Host ""
+            Write-Host "💾 Saving merged DSF..."
+            ($baseDsf | ConvertTo-Json -Depth 64) | Set-Content $workingDsf -Encoding UTF8
+          } else {
+            Write-Host ""
+            Write-Host "ℹ️  No overrides available. Using template as-is."
+          }
+
+          # ─────────────────────────────────────────────────────────────
+          # Final analysis and output
+          # ─────────────────────────────────────────────────────────────
+          $finalEnvVars  = @($baseDsf.EnvironmentVariables).Count
+          $finalConnRefs = @($baseDsf.ConnectionReferences).Count
+          $finalAgents   = if ($baseDsf.PSObject.Properties.Name -contains 'CopilotAgents') {
+            @($baseDsf.CopilotAgents).Count
+          } else { 0 }
+
+          $useDsf = ($finalEnvVars -gt 0 -or $finalConnRefs -gt 0 -or $finalAgents -gt 0)
+
+          Write-Host ""
+          Write-Host "─────────────────────────────────────────────────────────────"
+          Write-Host "Final DSF Statistics:"
+          Write-Host "  - Environment Variables: $finalEnvVars"
+          Write-Host "  - Connection References: $finalConnRefs"
+          Write-Host "  - Copilot Agents: $finalAgents"
+          Write-Host "  - Will Use DSF: $useDsf"
+          Write-Host "  - DSF Location: $workingDsf"
+          Write-Host "─────────────────────────────────────────────────────────────"
+
+          "use-dsf=$($useDsf.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "working-dsf=$workingDsf"                 | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+          # Debug: Print final DSF content (injected values are masked above)
+          Write-Host ""
+          Write-Host "📄 Final DSF Content:"
+          Write-Host "─────────────────────────────────────────────────────────────"
+          Get-Content $workingDsf -Raw | Write-Host
+          Write-Host "─────────────────────────────────────────────────────────────"
+
+          $fileSize = (Get-Item $workingDsf).Length
+          Write-Host "File size: $fileSize bytes"
+          Write-Host "═══════════════════════════════════════════════════════════"
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Step 5: Install Power Platform Tools
+      # ────────────────────────────────────────────────────────────────────────
+      # Single step replacing NuGetToolInstaller@1 + Cache@2 + NuGetCommand@2 +
+      # "Find pac CLI folder" + PowerPlatformToolInstaller@2.
+      - name: Install Power Platform Tools
+        uses: microsoft/powerplatform-actions/actions-install@v1
+        with:
+          add-tools-to-path: 'true'
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Step 5.5: Check if solution exists in target environment
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Check solution exists in target environment
+        id: check_solution
+        shell: pwsh
+        env:
+          PP_URL: ${{ secrets.PP_URL }}
+          PP_APP_ID: ${{ secrets.PP_APP_ID }}
+          PP_CLIENT_SECRET: ${{ secrets.PP_CLIENT_SECRET }}
+          PP_TENANT_ID: ${{ secrets.PP_TENANT_ID }}
+        run: |
+          # pac writes progress on stderr; with the pwsh shell GitHub prepends
+          # $ErrorActionPreference='Stop', which turns a stderr write from a
+          # native command into a terminating NativeCommandError.
+          $ErrorActionPreference = 'Continue'
+
+          Write-Host "═══════════════════════════════════════════════════════════"
+          Write-Host "STEP: Check Solution Exists in $($env:ENV_DISPLAY_NAME)"
+          Write-Host "═══════════════════════════════════════════════════════════"
+
+          $solutionName = $env:SOLUTION_NAME
+          Write-Host "Solution: $solutionName"
+          Write-Host ""
+
+          pac auth create `
+            --applicationId "$env:PP_APP_ID" `
+            --clientSecret "$env:PP_CLIENT_SECRET" `
+            --tenant "$env:PP_TENANT_ID" `
+            --environment "$env:PP_URL" `
+            --name "target-connection"
+
+          $output = pac solution list --json 2>&1 | Out-String
+
+          $jsonStart = $output.IndexOf('[')
+          if ($jsonStart -ge 0) {
+              $json = $output.Substring($jsonStart) | ConvertFrom-Json
+          } else {
+              Write-Host "::warning::Could not parse pac solution list output. Assuming fresh install."
+              Write-Host "Output: $output"
+              "solution-exists=false"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              "stage-and-upgrade=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              exit 0
+          }
+
+          $solution = $json | Where-Object { $_.SolutionUniqueName -eq $solutionName }
+
+          if ($solution) {
+              Write-Host "✓ Solution '$solutionName' found in $($env:ENV_DISPLAY_NAME)."
+              Write-Host "  Current version: $($solution.VersionNumber)"
+              Write-Host "  → StageAndUpgrade will be ENABLED (upgrade existing solution)."
+              "solution-exists=true"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              "stage-and-upgrade=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+              Write-Host "ℹ️  Solution '$solutionName' not found in $($env:ENV_DISPLAY_NAME)."
+              Write-Host "  → This is a fresh install. StageAndUpgrade will be DISABLED."
+              "solution-exists=false"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              "stage-and-upgrade=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+          Write-Host "═══════════════════════════════════════════════════════════"
+          # The pwsh wrapper appends `exit $LASTEXITCODE`; force a clean exit.
+          exit 0
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Step 6: Import Solution
+      # ────────────────────────────────────────────────────────────────────────
+      # ADO PowerPlatformImportSolution@2 -> GHA input mapping:
+      #   AsyncOperation                   -> run-asynchronously
+      #   StageAndUpgrade                  -> stage-and-upgrade
+      #   MaxAsyncWaitTime                 -> max-async-wait-time
+      #   PublishWorkflows                 -> activate-plugins
+      #   PublishCustomizationChanges      -> publish-changes
+      #   OverwriteUnmanagedCustomizations -> force-overwrite
+      #   UseDeploymentSettingsFile        -> use-deployment-settings-file
+      #   DeploymentSettingsFile           -> deployment-settings-file
+      - name: Import Solution
+        uses: microsoft/powerplatform-actions/import-solution@v1
+        with:
+          environment-url: ${{ secrets.PP_URL }}
+          app-id: ${{ secrets.PP_APP_ID }}
+          client-secret: ${{ secrets.PP_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.PP_TENANT_ID }}
+          solution-file: ${{ steps.find_solution.outputs.solution-file-path }}
+          run-asynchronously: 'true'
+          stage-and-upgrade: ${{ steps.check_solution.outputs.stage-and-upgrade }}
+          max-async-wait-time: ${{ inputs.maxAsyncWaitTime }}
+          activate-plugins: 'true'
+          publish-changes: ${{ inputs.deployManaged == false }}
+          force-overwrite: ${{ inputs.forceOverwrite }}
+          use-deployment-settings-file: ${{ steps.prepare_dsf.outputs.use-dsf }}
+          deployment-settings-file: ${{ steps.prepare_dsf.outputs.working-dsf }}
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Step 7: Deployment Summary
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Deployment summary
+        if: ${{ success() }}
+        shell: pwsh
+        env:
+          SOLUTION_ZIP:    ${{ steps.find_solution.outputs.solution-file-name }}
+          USE_DSF:         ${{ steps.prepare_dsf.outputs.use-dsf }}
+          SOLUTION_EXISTS: ${{ steps.check_solution.outputs.solution-exists }}
+          OVERRIDE_FP:     ${{ steps.write_overrides.outputs.override-fingerprint }}
+        run: |
+          $packageType = if ($env:DEPLOY_MANAGED -eq 'true') { 'Managed' } else { 'Unmanaged' }
+          $installType = if ($env:SOLUTION_EXISTS -eq 'true') { 'Upgrade (StageAndUpgrade)' } else { 'Fresh install' }
+          $overrideFp  = if ([string]::IsNullOrWhiteSpace($env:OVERRIDE_FP)) { '(no overrides applied)' } else { $env:OVERRIDE_FP }
+
+          Write-Host "═══════════════════════════════════════════════════════════"
+          Write-Host "DEPLOYMENT SUMMARY"
+          Write-Host "═══════════════════════════════════════════════════════════"
+          Write-Host "Environment: $($env:ENV_DISPLAY_NAME)"
+          Write-Host "Solution: $($env:SOLUTION_NAME)"
+          Write-Host "Package Type: $packageType"
+          Write-Host "Solution File: $($env:SOLUTION_ZIP)"
+          Write-Host "Force Overwrite: $($env:FORCE_OVERWRITE)"
+          Write-Host "Used DSF: $($env:USE_DSF)"
+          Write-Host "DSF Override Fingerprint: $overrideFp"
+          Write-Host "Solution Pre-existed: $($env:SOLUTION_EXISTS)"
+          Write-Host "Install Type: $installType"
+          Write-Host "═══════════════════════════════════════════════════════════"
+          Write-Host "✓ Deployment completed successfully"
+
+          $summary = @"
+          ## 🚀 Deployed to $($env:ENV_DISPLAY_NAME)
+
+          | Field | Value |
+          |---|---|
+          | Solution | **$($env:SOLUTION_NAME)** |
+          | Version | **$($env:SOLUTION_VERSION)** |
+          | Package Type | $packageType |
+          | Solution File | $($env:SOLUTION_ZIP) |
+          | Force Overwrite | $($env:FORCE_OVERWRITE) |
+          | Used DSF | $($env:USE_DSF) |
+          | DSF Override Fingerprint | $overrideFp |
+          | Solution Pre-existed | $($env:SOLUTION_EXISTS) |
+          | Install Type | $installType |
+          "@
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Step 8: Cleanup pac auth profiles
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Cleanup pac auth profiles
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host "Cleaning up pac auth profiles..."
+          pac auth clear
+          Write-Host "✓ pac auth profiles cleared"
+          exit 0
