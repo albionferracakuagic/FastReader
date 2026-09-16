@@ -1,0 +1,891 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# GitHub Actions port of `Pipelines/devops/power-platform-release.yaml` (Azure DevOps)
+# ══════════════════════════════════════════════════════════════════════════════
+# ⚠️ REPO-TEMPLATE LOCATION NOTICE
+# In THIS repo-template this file lives at `Pipelines/.github/workflows/`, purely
+# to keep it organized alongside the ADO port. GitHub Actions only discovers
+# workflows under `.github/workflows/` AT THE ROOT of a repository — so when you
+# copy this pipeline into a real project repo, this file (and its neighbours,
+# `deploy-to-env.yml` + `README.md`) MUST be moved to `.github/workflows/` at
+# that repo's root, not kept under a `Pipelines/` (or any other) subfolder.
+# Once relocated there, the `uses: ./.github/workflows/...` references below
+# resolve correctly again (see note next to each of them).
+#
+# Build : export the solution from DEV, commit it to git, tag it, generate the
+#         Deployment Settings File (DSF) template and publish everything as the
+#         `release-bundle` artifact.
+# Deploy: UAT -> (TEST || PRE_PROD) -> PROD, each one through the reusable
+#         workflow `./.github/workflows/deploy-to-env.yml`.
+#
+# The Azure DevOps pipeline (`Pipelines/devops/power-platform-release.yaml` +
+# `Pipelines/devops/templates/deploy-to-env.yaml`) is still the source of truth
+# for ADO and is NOT modified by this file. See
+# `Pipelines/.github/workflows/README.md` (-> `.github/workflows/README.md` once
+# relocated) for the full ADO -> GHA mapping, the required secrets and the
+# known differences.
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: Power Platform Release
+
+# ADO `name:` (build number) has no runtime-updatable equivalent in GHA.
+# `run-name` is evaluated once, before the run starts, so it can only use the
+# inputs that are known at dispatch time (not the resolved solution version).
+run-name: "Release ${{ inputs.SolutionName }} - requested by @${{ github.actor }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      SolutionName:
+        description: 'Unique solution name (not display name)'
+        type: string
+        required: true
+      AutoIncrementSolutionVersion:
+        description: 'Auto-increment solution version?'
+        type: boolean
+        required: false
+        default: true
+      SolutionVersion:
+        description: 'Solution version (used if auto-increment is disabled)'
+        type: string
+        required: false
+        default: '1.0.0.0'
+      deployManaged:
+        description: 'Deploy managed package?'
+        type: boolean
+        required: false
+        default: true
+      forceOverwrite:
+        description: 'Force overwrite unmanaged components'
+        type: boolean
+        required: false
+        default: false
+      ExportBothManagedAndUnmanaged:
+        description: 'Export both managed and unmanaged versions?'
+        type: boolean
+        required: false
+        default: true
+
+# `contents: write` is required by the build job to push the exported solution
+# and the version tag back to the repository with the default GITHUB_TOKEN.
+permissions:
+  contents: read
+
+# Serialising runs per solution replaces the ADO "rebase + resolve conflicts
+# with -X ours" dance: two concurrent releases of the SAME solution can no
+# longer race on `Solutions/<SolutionName>/**`, so a plain fast-forward pull is
+# enough. Runs for different solutions still execute in parallel.
+concurrency:
+  group: pp-release-${{ inputs.SolutionName }}
+  cancel-in-progress: false
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # BUILD: Export from DEV, push to git and generate the DSF template
+  # ════════════════════════════════════════════════════════════════════════════
+  build:
+    name: 'Build: export solution, push to GIT & generate DSF template'
+    runs-on: windows-latest
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    outputs:
+      solution-version: ${{ steps.version.outputs.solution-version }}
+
+    env:
+      # Inputs are surfaced as environment variables instead of being
+      # interpolated straight into the `run:` bodies. This avoids YAML quoting
+      # problems and closes the classic GitHub Actions script-injection hole
+      # (the ADO original inlines `${{ parameters.* }}` directly into PowerShell).
+      SOLUTION_NAME: ${{ inputs.SolutionName }}
+      SOLUTION_VERSION_INPUT: ${{ inputs.SolutionVersion }}
+      AUTO_INCREMENT: ${{ inputs.AutoIncrementSolutionVersion }}
+      DEPLOY_MANAGED: ${{ inputs.deployManaged }}
+      FORCE_OVERWRITE: ${{ inputs.forceOverwrite }}
+      EXPORT_BOTH: ${{ inputs.ExportBothManagedAndUnmanaged }}
+      SOLUTION_BASE_FOLDER: ${{ github.workspace }}\Solutions\${{ inputs.SolutionName }}
+      SOLUTION_COMPONENTS_FOLDER: ${{ github.workspace }}\Solutions\${{ inputs.SolutionName }}\Components
+      STAGING_DIR: ${{ github.workspace }}\artifact-staging
+
+    steps:
+      # ────────────────────────────────────────────────────────────────────────
+      # Checkout (equivalent of `- checkout: self` + `persistCredentials: true`)
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # persist-credentials defaults to true: the GITHUB_TOKEN is kept in
+          # the local git config so the commit/tag step below can push.
+          persist-credentials: true
+          # Full history + tags, so `git tag -l <name>` can actually detect an
+          # already existing tag (a shallow clone would not have them).
+          fetch-depth: 0
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Validate parameters
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Validate parameters
+        shell: pwsh
+        run: |
+          Write-Host "═══════════════════════════════════════════════════════════"
+          Write-Host "PARAMETER VALIDATION"
+          Write-Host "═══════════════════════════════════════════════════════════"
+          Write-Host ""
+
+          $hasErrors = $false
+
+          # Display all parameters
+          Write-Host "📋 Input Parameters:"
+          Write-Host "  - SolutionName: '$env:SOLUTION_NAME'"
+          Write-Host "  - AutoIncrementSolutionVersion: $env:AUTO_INCREMENT"
+          Write-Host "  - SolutionVersion: '$env:SOLUTION_VERSION_INPUT'"
+          Write-Host "  - deployManaged: $env:DEPLOY_MANAGED"
+          Write-Host "  - forceOverwrite: $env:FORCE_OVERWRITE"
+          Write-Host "  - ExportBothManagedAndUnmanaged: $env:EXPORT_BOTH"
+          Write-Host ""
+
+          # Validate SolutionName
+          Write-Host "🔍 Validating SolutionName..."
+          $solutionName = $env:SOLUTION_NAME
+
+          if ([string]::IsNullOrWhiteSpace($solutionName)) {
+              Write-Host "::error::SolutionName parameter cannot be empty"
+              Write-Host "❌ SolutionName is empty or whitespace"
+              $hasErrors = $true
+          } elseif ($solutionName -notmatch '^[a-zA-Z0-9_]+$') {
+              Write-Host "::error::SolutionName must contain only letters, numbers, and underscores. Invalid value: '$solutionName'"
+              Write-Host "❌ SolutionName contains invalid characters: '$solutionName'"
+              Write-Host "   Allowed characters: a-z, A-Z, 0-9, underscore (_)"
+
+              # Suggestion to fix the error
+              Write-Host "⚠️ Hint: Rename your solution to use only allowed characters."
+              $hasErrors = $true
+          } else {
+              Write-Host "✓ SolutionName validated: $solutionName"
+          }
+          Write-Host ""
+
+          # Validate version parameter if auto-increment is disabled
+          $autoIncrement = $env:AUTO_INCREMENT
+          Write-Host "🔍 Validating version settings..."
+          Write-Host "   AutoIncrementSolutionVersion: $autoIncrement"
+
+          if ($autoIncrement -eq 'False' -or $autoIncrement -eq 'false') {
+              Write-Host "   Auto-increment is disabled. Validating SolutionVersion parameter..."
+              $version = $env:SOLUTION_VERSION_INPUT
+
+              if ([string]::IsNullOrWhiteSpace($version)) {
+                  Write-Host "::error::SolutionVersion parameter must be provided when AutoIncrementSolutionVersion is false"
+                  Write-Host "❌ SolutionVersion is empty but required when auto-increment is disabled"
+                  $hasErrors = $true
+              } else {
+                  $parts = $version.Split('.')
+                  if ($parts.Count -ne 4) {
+                      Write-Host "::error::Invalid version format: $version. Expected format: major.minor.build.revision (e.g., 1.0.0.0)"
+                      Write-Host "❌ Invalid version format: '$version'"
+                      Write-Host "   Expected format: major.minor.build.revision (e.g., 1.0.0.0)"
+                      Write-Host "   Received $($parts.Count) parts instead of 4"
+                      $hasErrors = $true
+                  } else {
+                      # Validate each part is a valid number
+                      $allPartsValid = $true
+                      for ($i = 0; $i -lt 4; $i++) {
+                          $partValue = 0
+                          if (-not [int]::TryParse($parts[$i], [ref]$partValue)) {
+                              Write-Host "::error::Version part $($i + 1) is not a valid number: '$($parts[$i])'"
+                              Write-Host "❌ Version part $($i + 1) is not a valid number: '$($parts[$i])'"
+                              $allPartsValid = $false
+                              $hasErrors = $true
+                          }
+                      }
+                      if ($allPartsValid) {
+                          Write-Host "✓ SolutionVersion validated: $version"
+                      }
+                  }
+              }
+          } else {
+              Write-Host "✓ Auto-increment is enabled. Version will be determined from Dataverse."
+          }
+          Write-Host ""
+
+          # Summary
+          Write-Host "═══════════════════════════════════════════════════════════"
+          if ($hasErrors) {
+              Write-Host "❌ VALIDATION FAILED - See errors above"
+              Write-Host "═══════════════════════════════════════════════════════════"
+              exit 1
+          } else {
+              Write-Host "✓ ALL PARAMETERS VALIDATED SUCCESSFULLY"
+              Write-Host "═══════════════════════════════════════════════════════════"
+          }
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Install the Power Platform CLI
+      # ────────────────────────────────────────────────────────────────────────
+      # Replaces, in a single step: PowerPlatformToolInstaller@2 +
+      # NuGetToolInstaller@1 + Cache@2 + NuGetCommand@2 + "Find pac CLI folder".
+      #
+      # The ADO pipeline had to NuGet-install pac by hand and then hunt for the
+      # `tools` folder because PowerPlatformToolInstaller@2 does not expose pac
+      # on PATH. `actions-install` does, via `add-tools-to-path`, so the whole
+      # cache + discovery block is dropped.
+      #
+      # NOTE: `add-tools-to-path` is compared with the literal string "true"
+      # inside the action (`core.getInput(...) === 'true'`), so it MUST be
+      # passed explicitly as a string - omitting it leaves pac OUT of PATH and
+      # every `pac ...` step below would fail with "command not found".
+      #
+      # The Cache@2 step is deliberately NOT ported: `actions-install` pins the
+      # pac version it was built against and the nuget restore takes a few
+      # seconds on a warm runner; caching it would add a cache key to maintain
+      # for no meaningful gain.
+      - name: Install Power Platform Tools
+        uses: microsoft/powerplatform-actions/actions-install@v1
+        with:
+          add-tools-to-path: 'true'
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Verify the DEV service principal (equivalent of PowerPlatformWhoAmi@2)
+      # ────────────────────────────────────────────────────────────────────────
+      - name: WhoAmI (DEV)
+        uses: microsoft/powerplatform-actions/who-am-i@v1
+        with:
+          environment-url: ${{ secrets.PP_DEV_URL }}
+          app-id: ${{ secrets.PP_DEV_APP_ID }}
+          client-secret: ${{ secrets.PP_DEV_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.PP_DEV_TENANT_ID }}
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Create the pac auth profile used by the raw `pac` steps below
+      # ────────────────────────────────────────────────────────────────────────
+      # Replaces PowerPlatformSetConnectionVariables@2 + the `pac auth create`
+      # step: in GHA the SPN credentials are already in hand as secrets, so
+      # there is nothing to "extract" from a service connection.
+      - name: Create pac auth profile (DEV)
+        shell: pwsh
+        env:
+          PP_URL: ${{ secrets.PP_DEV_URL }}
+          PP_APP_ID: ${{ secrets.PP_DEV_APP_ID }}
+          PP_CLIENT_SECRET: ${{ secrets.PP_DEV_CLIENT_SECRET }}
+          PP_TENANT_ID: ${{ secrets.PP_DEV_TENANT_ID }}
+        run: |
+          pac auth create `
+            --applicationId "$env:PP_APP_ID" `
+            --clientSecret "$env:PP_CLIENT_SECRET" `
+            --tenant "$env:PP_TENANT_ID" `
+            --environment "$env:PP_URL" `
+            --name "dev-connection"
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Resolve the solution version
+      # ────────────────────────────────────────────────────────────────────────
+      # `$GITHUB_ENV` is the direct equivalent of ADO's
+      # `##vso[task.setvariable variable=X]` (job-scoped, visible to all the
+      # following steps), so NEW_SOLUTION_VERSION is written there regardless of
+      # which of the two mutually exclusive branches below actually runs.
+      - name: Get current solution version
+        if: ${{ inputs.AutoIncrementSolutionVersion == true }}
+        shell: pwsh
+        run: |
+          # `pac solution list` writes progress/telemetry noise on stderr; with
+          # the pwsh shell GitHub prepends $ErrorActionPreference='Stop', which
+          # would turn that noise into a terminating NativeCommandError.
+          $ErrorActionPreference = 'Continue'
+
+          $solutionName = $env:SOLUTION_NAME
+
+          # Capture output and filter to get only JSON
+          $output = pac solution list --json 2>&1 | Out-String
+
+          # Extract JSON array from output (handle cases where there's extra text)
+          $jsonStart = $output.IndexOf('[')
+          if ($jsonStart -ge 0) {
+              $jsonString = $output.Substring($jsonStart)
+              $json = $jsonString | ConvertFrom-Json
+          } else {
+              throw "No valid JSON found in pac solution list output. Output: $output"
+          }
+          $solution = $json | Where-Object { $_.SolutionUniqueName -eq $solutionName }
+
+          if (-not $solution) {
+              throw "Solution '$solutionName' not found in Dataverse."
+          }
+
+          $currentVersion = $solution.VersionNumber
+          Write-Host "Solution '$solutionName' current version: $currentVersion"
+
+          "CurrentSolutionVersion=$currentVersion" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Increment solution revision
+        if: ${{ inputs.AutoIncrementSolutionVersion == true }}
+        shell: pwsh
+        run: |
+          $version = $env:CurrentSolutionVersion
+          $parts = $version.Split('.')
+
+          if ($parts.Count -ne 4) {
+              throw "Invalid version format: $version"
+          }
+
+          # Only the 4th part (revision) is incremented, exactly like the ADO pipeline.
+          $parts[3] = ([int]$parts[3] + 1)
+          $newVersion = ($parts -join '.')
+
+          Write-Host "New version: $newVersion"
+          "NewSolutionVersion=$newVersion" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Set solution version from parameter
+        if: ${{ inputs.AutoIncrementSolutionVersion == false }}
+        shell: pwsh
+        run: |
+          $version = $env:SOLUTION_VERSION_INPUT
+
+          Write-Host "Using provided version: $version"
+          "NewSolutionVersion=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Promote the job-scoped variable to a job OUTPUT so the deploy jobs
+      # (separate jobs => separate runners => no shared $GITHUB_ENV) can read it.
+      - name: Expose resolved version
+        id: version
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:NewSolutionVersion)) {
+              throw "NewSolutionVersion was not resolved."
+          }
+          Write-Host "Resolved solution version: $env:NewSolutionVersion"
+          "solution-version=$env:NewSolutionVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Apply the version in Dataverse
+      # ────────────────────────────────────────────────────────────────────────
+      # 1:1 replacement for PowerPlatformSetSolutionVersion@2. This action is
+      # NOT listed on Microsoft Learn's "Available GitHub Actions" page but it
+      # does exist in microsoft/powerplatform-actions (folder
+      # `set-online-solution-version`), so no PowerShell fallback is needed.
+      - name: Update Dataverse solution version
+        uses: microsoft/powerplatform-actions/set-online-solution-version@v1
+        with:
+          environment-url: ${{ secrets.PP_DEV_URL }}
+          app-id: ${{ secrets.PP_DEV_APP_ID }}
+          client-secret: ${{ secrets.PP_DEV_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.PP_DEV_TENANT_ID }}
+          name: ${{ inputs.SolutionName }}
+          version: ${{ env.NewSolutionVersion }}
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Export managed
+      # ────────────────────────────────────────────────────────────────────────
+      # GHA has no `retryCountOnTaskFailure`. The retry is reproduced natively
+      # with `continue-on-error` on the first attempt plus a second step guarded
+      # by `steps.<id>.outcome == 'failure'`; if the retry fails too, the job
+      # fails normally (no continue-on-error on the retry).
+      - name: Export managed from DEV
+        id: export_managed
+        if: ${{ inputs.deployManaged == true || inputs.ExportBothManagedAndUnmanaged == true }}
+        continue-on-error: true
+        uses: microsoft/powerplatform-actions/export-solution@v1
+        with:
+          environment-url: ${{ secrets.PP_DEV_URL }}
+          app-id: ${{ secrets.PP_DEV_APP_ID }}
+          client-secret: ${{ secrets.PP_DEV_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.PP_DEV_TENANT_ID }}
+          solution-name: ${{ inputs.SolutionName }}
+          solution-output-file: ${{ github.workspace }}\Solutions\${{ inputs.SolutionName }}\${{ inputs.SolutionName }}_${{ env.NewSolutionVersion }}_managed.zip
+          managed: 'true'
+          overwrite: 'true'
+          run-asynchronously: 'true'
+          max-async-wait-time: '120'
+
+      - name: Export managed from DEV (retry)
+        if: ${{ steps.export_managed.outcome == 'failure' }}
+        uses: microsoft/powerplatform-actions/export-solution@v1
+        with:
+          environment-url: ${{ secrets.PP_DEV_URL }}
+          app-id: ${{ secrets.PP_DEV_APP_ID }}
+          client-secret: ${{ secrets.PP_DEV_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.PP_DEV_TENANT_ID }}
+          solution-name: ${{ inputs.SolutionName }}
+          solution-output-file: ${{ github.workspace }}\Solutions\${{ inputs.SolutionName }}\${{ inputs.SolutionName }}_${{ env.NewSolutionVersion }}_managed.zip
+          managed: 'true'
+          overwrite: 'true'
+          run-asynchronously: 'true'
+          max-async-wait-time: '120'
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Export unmanaged
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Export unmanaged from DEV
+        id: export_unmanaged
+        if: ${{ inputs.deployManaged == false || inputs.ExportBothManagedAndUnmanaged == true }}
+        continue-on-error: true
+        uses: microsoft/powerplatform-actions/export-solution@v1
+        with:
+          environment-url: ${{ secrets.PP_DEV_URL }}
+          app-id: ${{ secrets.PP_DEV_APP_ID }}
+          client-secret: ${{ secrets.PP_DEV_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.PP_DEV_TENANT_ID }}
+          solution-name: ${{ inputs.SolutionName }}
+          solution-output-file: ${{ github.workspace }}\Solutions\${{ inputs.SolutionName }}\${{ inputs.SolutionName }}_${{ env.NewSolutionVersion }}_unmanaged.zip
+          managed: 'false'
+          overwrite: 'true'
+          run-asynchronously: 'true'
+          max-async-wait-time: '120'
+
+      - name: Export unmanaged from DEV (retry)
+        if: ${{ steps.export_unmanaged.outcome == 'failure' }}
+        uses: microsoft/powerplatform-actions/export-solution@v1
+        with:
+          environment-url: ${{ secrets.PP_DEV_URL }}
+          app-id: ${{ secrets.PP_DEV_APP_ID }}
+          client-secret: ${{ secrets.PP_DEV_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.PP_DEV_TENANT_ID }}
+          solution-name: ${{ inputs.SolutionName }}
+          solution-output-file: ${{ github.workspace }}\Solutions\${{ inputs.SolutionName }}\${{ inputs.SolutionName }}_${{ env.NewSolutionVersion }}_unmanaged.zip
+          managed: 'false'
+          overwrite: 'true'
+          run-asynchronously: 'true'
+          max-async-wait-time: '120'
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Unpack the unmanaged solution into Components/
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Unpack Solution
+        if: ${{ inputs.deployManaged == false || inputs.ExportBothManagedAndUnmanaged == true }}
+        uses: microsoft/powerplatform-actions/unpack-solution@v1
+        with:
+          solution-file: ${{ github.workspace }}\Solutions\${{ inputs.SolutionName }}\${{ inputs.SolutionName }}_${{ env.NewSolutionVersion }}_unmanaged.zip
+          solution-folder: ${{ github.workspace }}\Solutions\${{ inputs.SolutionName }}\Components
+          solution-type: 'Unmanaged'
+          overwrite-files: 'true'
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Commit, push and tag
+      # ────────────────────────────────────────────────────────────────────────
+      # SIMPLIFIED vs ADO on purpose. The original had a ~90 line
+      # rebase/-X ours/abort/merge --allow-unrelated-histories recovery block
+      # whose only job was to survive two concurrent pipeline runs writing to
+      # the same `Solutions/<SolutionName>` folder. In GHA that race is removed
+      # structurally by the workflow-level `concurrency:` group above, so a
+      # plain `pull --rebase` (which will simply replay our single commit on top
+      # of any unrelated commit) is enough. If the rebase still fails, the step
+      # fails loudly instead of silently forcing "ours".
+      - name: Commit solution changes, push and create version tag
+        shell: pwsh
+        env:
+          GIT_AUTHOR_NAME: ${{ github.actor }}
+          GIT_AUTHOR_EMAIL: ${{ github.actor }}@users.noreply.github.com
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          git config user.email "$env:GIT_AUTHOR_EMAIL"
+          git config user.name  "$env:GIT_AUTHOR_NAME"
+
+          $solutionName = $env:SOLUTION_NAME
+          $newVersion   = $env:NewSolutionVersion
+          $baseFolder   = $env:SOLUTION_BASE_FOLDER
+          $branch       = $env:TARGET_BRANCH
+
+          Write-Host "🔍 Checking current git status..."
+          $statusBeforePull = git status --porcelain
+          Write-Host "Git status output:"
+          if ([string]::IsNullOrWhiteSpace($statusBeforePull)) {
+              Write-Host "  (no changes)"
+          } else {
+              Write-Host $statusBeforePull
+          }
+          Write-Host ""
+
+          # Check if there are changes to commit
+          if ([string]::IsNullOrWhiteSpace($statusBeforePull)) {
+              Write-Host "⚠️  No changes detected. Skipping commit."
+              Write-Host "::warning::No changes to commit for solution $solutionName"
+              exit 0
+          }
+
+          Write-Host "📝 Staging changes..."
+          git add -- "$baseFolder"
+
+          Write-Host "🔍 Checking git status after staging..."
+          $statusAfterStaging = git status --porcelain
+          if ([string]::IsNullOrWhiteSpace($statusAfterStaging)) {
+              Write-Host "  (no changes - this shouldn't happen)"
+          } else {
+              Write-Host $statusAfterStaging
+          }
+          Write-Host ""
+
+          Write-Host "📝 Committing changes..."
+          git commit -m "Updated $solutionName solution to version $newVersion"
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::git commit failed"
+              exit 1
+          }
+
+          Write-Host "📥 Rebasing on top of origin/$branch..."
+          git fetch origin $branch
+          git pull --rebase origin $branch
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::Rebase onto origin/$branch failed. Resolve the conflict manually and re-run the workflow."
+              git rebase --abort
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "📤 Pushing to remote (branch: $branch)..."
+          git push origin "HEAD:refs/heads/$branch"
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::Failed to push changes to remote"
+              exit 1
+          }
+          Write-Host ""
+
+          # Handle tags
+          Write-Host "🏷️  Managing version tag..."
+          $tagName = "$solutionName-v$newVersion"
+
+          $tagExists = git tag -l $tagName
+          if ($tagExists) {
+              Write-Host "⚠️  Tag $tagName already exists locally. Skipping tag creation."
+              Write-Host "::warning::Tag $tagName already exists"
+          } else {
+              Write-Host "Creating tag: $tagName"
+              git tag $tagName
+
+              Write-Host "Pushing tag to remote..."
+              git push origin $tagName
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "::warning::Failed to push tag. It may already exist on remote."
+              } else {
+                  Write-Host "✓ Successfully tagged with $tagName"
+              }
+          }
+
+          # The pwsh shell wrapper appends `exit $LASTEXITCODE`; force a clean
+          # exit so a tolerated non-zero git exit code cannot fail the step.
+          exit 0
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Generate the Deployment Settings File (DSF) template
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Generate deployment settings file (DSF)
+        shell: pwsh
+        run: |
+          pac --version
+
+          New-Item -ItemType Directory -Force -Path "$env:STAGING_DIR" | Out-Null
+
+          # Find the solution zip file to use for DSF generation
+          $deployManaged = $env:DEPLOY_MANAGED
+          $pattern = if ($deployManaged -eq 'true') { '*_managed.zip' } else { '*_unmanaged.zip' }
+          $solutionZip = Get-ChildItem -Path "$env:SOLUTION_BASE_FOLDER" -Filter $pattern | Sort-Object Name | Select-Object -First 1
+
+          if (-not $solutionZip) {
+              throw "No solution zip file found matching pattern: $pattern"
+          }
+
+          Write-Host "Using solution file: $($solutionZip.FullName)"
+
+          pac solution create-settings `
+            --solution-zip "$($solutionZip.FullName)" `
+            --settings-file "$env:STAGING_DIR\$($env:SOLUTION_NAME).settings.json"
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Inspect the generated DSF
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Inspect Deployment Settings File
+        shell: pwsh
+        run: |
+          $dsfPath = "$env:STAGING_DIR\$($env:SOLUTION_NAME).settings.json"
+
+          Write-Host "═══════════════════════════════════════════════════════════"
+          Write-Host "DEPLOYMENT SETTINGS FILE (DSF) CONTENT"
+          Write-Host "═══════════════════════════════════════════════════════════"
+          Write-Host "File: $dsfPath"
+          Write-Host ""
+
+          if (Test-Path $dsfPath) {
+              $dsfContent = Get-Content $dsfPath -Raw
+              $dsf = $dsfContent | ConvertFrom-Json
+
+              # Display formatted JSON
+              Write-Host "📄 DSF JSON Content:"
+              Write-Host "───────────────────────────────────────────────────────────"
+              Write-Host $dsfContent
+              Write-Host "───────────────────────────────────────────────────────────"
+              Write-Host ""
+
+              # Analyze configuration requirements
+              $envVarsCount = @($dsf.EnvironmentVariables).Count
+              $connRefsCount = @($dsf.ConnectionReferences).Count
+              $copilotAgentsCount = if ($dsf.PSObject.Properties.Name -contains 'CopilotAgents') {
+                  @($dsf.CopilotAgents).Count
+              } else { 0 }
+
+              Write-Host "📊 Configuration Summary:"
+              Write-Host "  - Environment Variables: $envVarsCount"
+              Write-Host "  - Connection References: $connRefsCount"
+              Write-Host "  - Copilot Agents: $copilotAgentsCount"
+              Write-Host ""
+
+              if ($envVarsCount -gt 0) {
+                  Write-Host "🔧 Environment Variables requiring configuration:"
+                  $dsf.EnvironmentVariables | ForEach-Object {
+                      Write-Host "  • $($_.SchemaName) (Current: '$($_.Value)')"
+                  }
+                  Write-Host ""
+              }
+
+              if ($connRefsCount -gt 0) {
+                  Write-Host "🔌 Connection References requiring configuration:"
+                  $dsf.ConnectionReferences | ForEach-Object {
+                      Write-Host "  • $($_.LogicalName) - $($_.ConnectorId)"
+                  }
+                  Write-Host ""
+              }
+
+              if ($copilotAgentsCount -gt 0) {
+                  Write-Host "🤖 Copilot Agents requiring configuration:"
+                  $dsf.CopilotAgents | ForEach-Object {
+                      $agentName = if ($_.Name) { $_.Name } else { $_.Id }
+                      Write-Host "  • $agentName"
+                  }
+                  Write-Host ""
+              }
+
+              $requiresConfig = ($envVarsCount -gt 0 -or $connRefsCount -gt 0 -or $copilotAgentsCount -gt 0)
+
+              if ($requiresConfig) {
+                  Write-Host "⚠️  ACTION REQUIRED:"
+                  Write-Host "   Update the per-environment override secrets (PP_UAT_DSF_OVERRIDES,"
+                  Write-Host "   PP_TEST_DSF_OVERRIDES, PP_PRE_PROD_DSF_OVERRIDES, PP_PROD_DSF_OVERRIDES)"
+                  Write-Host "   with environment-specific values before deploying."
+                  Write-Host "::warning::DSF contains $envVarsCount env variables and $connRefsCount connection references that need configuration"
+              } else {
+                  Write-Host "✓ No environment-specific configuration required."
+              }
+
+              Write-Host "═══════════════════════════════════════════════════════════"
+          } else {
+              Write-Host "⚠️  DSF file not found at: $dsfPath"
+              Write-Host "::warning::DSF file was not generated"
+              Write-Host "═══════════════════════════════════════════════════════════"
+          }
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Stage the zips next to the DSF
+      # ────────────────────────────────────────────────────────────────────────
+      # Maybe the unmanaged solution should not be saved in the GIT repo
+      # Since it can be created using `pac solution pack` command in the Components folder
+      - name: Copy solution zip files to artifact staging
+        shell: pwsh
+        run: |
+          $base = $env:SOLUTION_BASE_FOLDER
+          $name = $env:SOLUTION_NAME
+          $ver  = $env:NewSolutionVersion
+
+          $managedZip   = "$base\$($name)_$($ver)_managed.zip"
+          $unmanagedZip = "$base\$($name)_$($ver)_unmanaged.zip"
+
+          if (Test-Path $managedZip) {
+              Copy-Item -Path $managedZip -Destination "$env:STAGING_DIR" -Force
+              Write-Host "Copied: $($name)_$($ver)_managed.zip"
+          }
+
+          if (Test-Path $unmanagedZip) {
+              Copy-Item -Path $unmanagedZip -Destination "$env:STAGING_DIR" -Force
+              Write-Host "Copied: $($name)_$($ver)_unmanaged.zip"
+          }
+
+          Write-Host "`nArtifact staging directory contents:"
+          Get-ChildItem "$env:STAGING_DIR" | ForEach-Object { Write-Host "  - $($_.Name)" }
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Publish the release bundle
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Publish release bundle (zips + DSF template)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: ${{ github.workspace }}\artifact-staging\
+          if-no-files-found: error
+          retention-days: 30
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Build summary
+      # ────────────────────────────────────────────────────────────────────────
+      # GHA has no equivalent of `##vso[build.addbuildtag]` or
+      # `##vso[build.updatebuildnumber]`; the job summary is the closest thing
+      # that surfaces the resolved version in the run UI.
+      - name: Build summary
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          # Markdown code spans are deliberately avoided here: inside a PowerShell
+          # double-quoted here-string the backtick is the escape character, so a
+          # literal backtick would have to be doubled and is easy to get wrong.
+          $name = $env:SOLUTION_NAME
+          $ver  = $env:NewSolutionVersion
+
+          $summary = @"
+          ## 📦 Power Platform build
+
+          | Field | Value |
+          |---|---|
+          | Solution | **$name** |
+          | Version | **$ver** |
+          | Tag | **$name-v$ver** |
+          | Auto-increment | $env:AUTO_INCREMENT |
+          | Deploy managed | $env:DEPLOY_MANAGED |
+          | Force overwrite | $env:FORCE_OVERWRITE |
+          | Export both | $env:EXPORT_BOTH |
+          | Artifact | release-bundle |
+          "@
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Cleanup
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Cleanup pac auth profiles
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host "Cleaning up pac auth profiles..."
+          pac auth clear
+          Write-Host "✓ pac auth profiles cleared"
+          exit 0
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Deploy to UAT
+  # ════════════════════════════════════════════════════════════════════════════
+  # ⚠️ `uses: ./.github/workflows/deploy-to-env.yml` below is a LOCAL reusable
+  # workflow reference. GitHub Actions resolves this path relative to the
+  # REPOSITORY ROOT, not relative to this file — so the syntax itself is
+  # correct and does NOT need to change when this file moves. It only works,
+  # however, once both this file and `deploy-to-env.yml` actually live at
+  # `.github/workflows/` at the root of the repo that runs them (see the
+  # repo-template location notice at the top of this file). In this
+  # repo-template (files parked under `Pipelines/.github/workflows/`) this
+  # reference does not resolve — that is expected and is not a bug.
+  deploy_uat:
+    name: 'Deploy to UAT'
+    needs: build
+    uses: ./.github/workflows/deploy-to-env.yml
+    with:
+      environmentName: 'UAT'
+      environmentDisplayName: 'UAT (User Acceptance Testing)'
+      solutionName: ${{ inputs.SolutionName }}
+      solutionVersion: ${{ needs.build.outputs.solution-version }}
+      artifactName: 'release-bundle'
+      deployManaged: ${{ inputs.deployManaged }}
+      forceOverwrite: ${{ inputs.forceOverwrite }}
+      timeoutMinutes: 300
+      maxAsyncWaitTime: 120
+    # Secrets are passed explicitly instead of `secrets: inherit` so that the
+    # blast radius of this workflow is auditable from this file alone: each
+    # deploy job only ever receives the credentials of its own environment.
+    #
+    # ⚠️ READ TIMING: everything referenced as `secrets.*` HERE is a
+    # repository/organization secret, and those "are read when a workflow run is
+    # queued" - so editing one while this run is in flight (e.g. while a deploy
+    # job waits for approval) has NO effect on this run. That is exactly the
+    # Azure DevOps queue-time-snapshot problem, reproduced.
+    # `PP_<ENV>_DSF_OVERRIDES` below is therefore a LEGACY FALLBACK only: define
+    # the override as an ENVIRONMENT secret named `PP_DSF_OVERRIDES` on the
+    # matching GitHub Environment instead. Environment secrets "are read when a
+    # job referencing the environment starts" and take precedence over the value
+    # passed from here. See the neighbouring `README.md` §5.1 (this file's
+    # `Pipelines/.github/workflows/README.md` here; `.github/workflows/README.md`
+    # once relocated to a real project repo).
+    # https://docs.github.com/en/actions/reference/security/secrets#when-github-actions-reads-secrets
+    secrets:
+      PP_URL: ${{ secrets.PP_UAT_URL }}
+      PP_APP_ID: ${{ secrets.PP_UAT_APP_ID }}
+      PP_CLIENT_SECRET: ${{ secrets.PP_UAT_CLIENT_SECRET }}
+      PP_TENANT_ID: ${{ secrets.PP_UAT_TENANT_ID }}
+      PP_DSF_OVERRIDES: ${{ secrets.PP_UAT_DSF_OVERRIDES }}
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Deploy to TEST
+  # ════════════════════════════════════════════════════════════════════════════
+  deploy_test:
+    name: 'Deploy to TEST'
+    # `build` must be listed explicitly even though it is already a transitive
+    # dependency: the `needs` context only exposes the jobs named in `needs`,
+    # so `needs.build.outputs.solution-version` would be null otherwise.
+    needs: [build, deploy_uat]
+    # See the "repo-root relative path" note next to `deploy_uat` above.
+    uses: ./.github/workflows/deploy-to-env.yml
+    with:
+      environmentName: 'TEST'
+      environmentDisplayName: 'TEST (Testing)'
+      solutionName: ${{ inputs.SolutionName }}
+      solutionVersion: ${{ needs.build.outputs.solution-version }}
+      artifactName: 'release-bundle'
+      deployManaged: ${{ inputs.deployManaged }}
+      forceOverwrite: ${{ inputs.forceOverwrite }}
+      timeoutMinutes: 300
+      maxAsyncWaitTime: 120
+    # See the READ TIMING note on `deploy_uat`: `PP_TEST_DSF_OVERRIDES` is a
+    # queue-time fallback, prefer the `PP_DSF_OVERRIDES` environment secret.
+    secrets:
+      PP_URL: ${{ secrets.PP_TEST_URL }}
+      PP_APP_ID: ${{ secrets.PP_TEST_APP_ID }}
+      PP_CLIENT_SECRET: ${{ secrets.PP_TEST_CLIENT_SECRET }}
+      PP_TENANT_ID: ${{ secrets.PP_TEST_TENANT_ID }}
+      PP_DSF_OVERRIDES: ${{ secrets.PP_TEST_DSF_OVERRIDES }}
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Deploy to PRE-PROD (runs in parallel with TEST, both gated on UAT)
+  # ════════════════════════════════════════════════════════════════════════════
+  deploy_pre_prod:
+    name: 'Deploy to PRE-PROD'
+    needs: [build, deploy_uat]
+    # See the "repo-root relative path" note next to `deploy_uat` above.
+    uses: ./.github/workflows/deploy-to-env.yml
+    with:
+      environmentName: 'PRE_PROD'
+      environmentDisplayName: 'PRE-PROD (Pre Production)'
+      solutionName: ${{ inputs.SolutionName }}
+      solutionVersion: ${{ needs.build.outputs.solution-version }}
+      artifactName: 'release-bundle'
+      deployManaged: ${{ inputs.deployManaged }}
+      forceOverwrite: ${{ inputs.forceOverwrite }}
+      timeoutMinutes: 300
+      maxAsyncWaitTime: 120
+    # See the READ TIMING note on `deploy_uat`: `PP_PRE_PROD_DSF_OVERRIDES` is a
+    # queue-time fallback, prefer the `PP_DSF_OVERRIDES` environment secret.
+    secrets:
+      PP_URL: ${{ secrets.PP_PRE_PROD_URL }}
+      PP_APP_ID: ${{ secrets.PP_PRE_PROD_APP_ID }}
+      PP_CLIENT_SECRET: ${{ secrets.PP_PRE_PROD_CLIENT_SECRET }}
+      PP_TENANT_ID: ${{ secrets.PP_PRE_PROD_TENANT_ID }}
+      PP_DSF_OVERRIDES: ${{ secrets.PP_PRE_PROD_DSF_OVERRIDES }}
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Deploy to PROD
+  # ════════════════════════════════════════════════════════════════════════════
+  deploy_prod:
+    name: 'Deploy to PROD'
+    needs: [build, deploy_pre_prod]
+    # See the "repo-root relative path" note next to `deploy_uat` above.
+    uses: ./.github/workflows/deploy-to-env.yml
+    with:
+      environmentName: 'PROD'
+      environmentDisplayName: 'PROD (Production)'
+      solutionName: ${{ inputs.SolutionName }}
+      solutionVersion: ${{ needs.build.outputs.solution-version }}
+      artifactName: 'release-bundle'
+      deployManaged: ${{ inputs.deployManaged }}
+      forceOverwrite: ${{ inputs.forceOverwrite }}
+      timeoutMinutes: 300
+      maxAsyncWaitTime: 120
+    # See the READ TIMING note on `deploy_uat`: `PP_PROD_DSF_OVERRIDES` is a
+    # queue-time fallback, prefer the `PP_DSF_OVERRIDES` environment secret.
+    secrets:
+      PP_URL: ${{ secrets.PP_PROD_URL }}
+      PP_APP_ID: ${{ secrets.PP_PROD_APP_ID }}
+      PP_CLIENT_SECRET: ${{ secrets.PP_PROD_CLIENT_SECRET }}
+      PP_TENANT_ID: ${{ secrets.PP_PROD_TENANT_ID }}
+      PP_DSF_OVERRIDES: ${{ secrets.PP_PROD_DSF_OVERRIDES }}
